@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bg3-friend"
+version = "0.1.0"
+description = "Experimental BG3 companion co-player using Codex Astra"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest==9.1.1", "lupa==2.8"]
+
+[tool.setuptools]
+packages = ["companion"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

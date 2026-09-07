@@ -1,0 +1,5 @@
+new entry "BG3FRIEND_AUTOCOMBAT"
+type "StatusData"
+data "StatusType" "BOOST"
+data "StatusPropertyFlags" "LoseControl;LoseControlFriendly;DisableOverhead;DisableCombatlog;DisablePortraitIndicator"
+data "RemoveEvents" "OnCombatEnded"
