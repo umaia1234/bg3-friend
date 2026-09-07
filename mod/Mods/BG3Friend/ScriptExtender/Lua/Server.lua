@@ -3,6 +3,7 @@ local B = {session = "", seq = 0, active = nil, result = nil, lastCommand = "", 
 local MOD_UUID = "cfd9c54e-3884-47ed-9b40-82b8747194de"
 local COMBAT_STATUS = "BG3FRIEND_AUTOCOMBAT"
 Ext.Vars.RegisterModVariable(MOD_UUID, "OwnedFollowFlag", {Server=true, Client=false, Persistent=true})
+Ext.Vars.RegisterModVariable(MOD_UUID, "OwnedPartyGroup", {Server=true, Client=false, Persistent=true})
 Ext.Vars.RegisterModVariable(MOD_UUID, "OwnedCombat", {Server=true, Client=false, Persistent=true})
 Ext.Vars.RegisterModVariable(MOD_UUID, "Introductions", {Server=true, Client=false, Persistent=true})
 local PREFIX = "BG3Friend/"
@@ -77,6 +78,12 @@ local function describe(entity, host, focused)
 end
 local function finish(status, detail)
     if B.active then
+        if status == "completed" then
+            -- Arrival uses a tolerance. End our remaining engine movement
+            -- before reporting completion or accepting a subsequent wait.
+            query("PurgeOsirisQueue", B.active.actor, 1)
+            query("FlushOsirisQueue", B.active.actor)
+        end
         B.result = {id = B.active.id, status = status, detail = detail, actor = B.active.actor}
         B.active = nil
     end
@@ -98,7 +105,9 @@ local function save_ownership(vars, name, owned)
     -- Reassign the table so pending restoration is also persisted in a save.
     vars[name] = (owned.actor or next(owned.releasing)) and owned or nil
 end
-local function restore_follow()
+-- Old saves can contain our deprecated NoFollow flag. Only undo owned flags;
+-- new exploration control uses the documented player-party chaining API.
+local function restore_legacy_follow()
     local vars, owned = ownership("OwnedFollowFlag")
     for actor in pairs(owned.releasing) do
         if Ext.Entity.Get(actor) then
@@ -112,14 +121,67 @@ local function restore_follow()
     end
     save_ownership(vars, "OwnedFollowFlag", owned)
 end
-local function release()
+local function release_legacy_follow()
     local vars, owned = ownership("OwnedFollowFlag")
     if owned.actor then
         owned.releasing[owned.actor] = true
         owned.actor = nil
     end
     save_ownership(vars, "OwnedFollowFlag", owned)
-    B.held = nil
+    restore_legacy_follow()
+end
+local function party_links(actor)
+    if not Ext.Entity.Get(actor) then return nil end
+    local ok, rows = pcall(function() return Osi.DB_PartyMembers:Get(nil) end)
+    if not ok then return nil end
+    local links, member = {}, false
+    for _, row in ipairs(rows) do
+        local peer = canonical(row[1])
+        if peer == actor then member = true
+        elseif Ext.Entity.Get(peer) then
+            local linked = query("InSamePartyGroup", actor, peer)
+            if linked == nil then return nil end
+            if linked == 1 then links[#links+1] = peer end
+        end
+    end
+    return member and links or nil
+end
+local function restore_follow()
+    restore_legacy_follow()
+    local vars, owned = ownership("OwnedPartyGroup")
+    for actor, pending in pairs(owned.releasing) do
+        local links = party_links(actor)
+        if links then
+            if #links == 0 then pending.awaiting_detach = false end
+            if not pending.awaiting_detach then
+                -- A player may already have regrouped this character. Respect
+                -- that choice; never detach anyone as part of restoration.
+                if #links > 0 then owned.releasing[actor] = nil
+                else
+                    for _, peer in ipairs(pending.peers) do
+                        if party_links(peer) then
+                            query("AttachToPartyGroup", actor, peer)
+                            if query("InSamePartyGroup", actor, peer) == 1 then
+                                owned.releasing[actor] = nil
+                            end
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+    save_ownership(vars, "OwnedPartyGroup", owned)
+end
+local function release()
+    release_legacy_follow()
+    local vars, owned = ownership("OwnedPartyGroup")
+    if owned.actor then
+        owned.releasing[owned.actor] = {peers=owned.peers, awaiting_detach=owned.awaiting_detach}
+        owned.actor = nil; owned.peers = nil; owned.awaiting_detach = nil
+    end
+    save_ownership(vars, "OwnedPartyGroup", owned)
+    B.held = nil; B.followActor = nil
     restore_follow()
 end
 local function restore_combat()
@@ -191,21 +253,48 @@ local function sync_control(state, control)
     local take = state.runner_connected and control.enabled and control.session == B.session
         and state.companion and not state.companion.selected and not state.blocked
     local actor = take and state.companion.id or nil
-    if actor ~= B.held then
+    if actor ~= B.followActor then
         cancel("플레이어 제어 또는 연결 변경으로 이동을 멈췄어.")
         release()
-        if actor then
-            local old = query("HasNoFollowFlag", actor)
-            local vars, owned = ownership("OwnedFollowFlag")
-            if old == 0 or (old == 1 and owned.releasing[actor]) then
-                owned.actor = actor; owned.releasing[actor] = nil
-                save_ownership(vars, "OwnedFollowFlag", owned)
-                if old == 0 then query("SetNoFollowFlag", actor, 1) end
-            end
-            if query("HasNoFollowFlag", actor) == 1 then B.held = actor end
-        end
+        B.followActor = actor
     end
-    state.independent = B.held ~= nil
+    local vars, owned = ownership("OwnedPartyGroup")
+    local links = actor and party_links(actor) or nil
+    if actor and B.held == actor and links and #links > 0 then
+        -- Regrouping through the game's chain UI is a manual takeover.
+        -- Yield until the user changes the companion/control revision.
+        cancel("파티 연결이 바뀌어서 이동을 멈췄어.")
+        owned.actor = nil; owned.peers = nil; owned.awaiting_detach = nil
+        owned.releasing[actor] = nil
+        B.followOverride = {actor=actor, revision=control.revision}
+        B.held = nil
+    end
+    local overridden = actor and B.followOverride and B.followOverride.actor == actor
+        and B.followOverride.revision == control.revision
+    if actor and not overridden then
+        if owned.releasing[actor] then
+            local pending = owned.releasing[actor]
+            owned.actor = actor; owned.peers = pending.peers; owned.awaiting_detach = pending.awaiting_detach
+            owned.releasing[actor] = nil
+        end
+        if links and #links > 0 and owned.actor ~= actor then
+            owned.actor = actor; owned.peers = links; owned.awaiting_detach = true
+            save_ownership(vars, "OwnedPartyGroup", owned)
+            local ok = pcall(Osi.DetachFromPartyGroup, actor)
+            if not ok then
+                owned.actor = nil; owned.peers = nil; owned.awaiting_detach = nil
+            end
+            links = party_links(actor)
+        end
+        if links and #links == 0 and owned.actor == actor then owned.awaiting_detach = false end
+        B.held = links and #links == 0 and actor or nil
+    else B.held = nil end
+    save_ownership(vars, "OwnedPartyGroup", owned)
+    if overridden then state.blocked = state.blocked or "party_group_changed" end
+    state.follow_control = "party_group"
+    local actual = state.companion and party_links(state.companion.id) or nil
+    state.party_linked = actual and #actual > 0 or false
+    state.independent = B.held ~= nil and actual ~= nil and #actual == 0
     sync_combat(state, control)
 end
 local function snapshot()
@@ -398,7 +487,7 @@ local function start()
     B.lastConnection=nil; B.connectionResult=nil; B.deferred=nil
     B.intro=Ext.Vars.GetModVariables(MOD_UUID).Introductions or {met={},choices={}}
     B.intro.met=B.intro.met or {}; B.intro.choices=B.intro.choices or {}
-    B.beat=nil; B.beatAt=nil
+    B.beat=nil; B.beatAt=nil; B.followOverride=nil
     print("[BG3Friend] Session " .. B.session)
 end
 Ext.Events.SessionLoaded:Subscribe(start)

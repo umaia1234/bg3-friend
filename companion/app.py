@@ -427,6 +427,8 @@ class DesktopApp:
             error = read_json(self.config_root / "worker-error.json") or {}
             if error.get("message"):
                 self.notice.set(error["message"])
+            else:
+                self.notice.set("파티 대화를 종료했습니다.")
             self.worker = None
             self.worker_io = None
             self.stop_pending = False

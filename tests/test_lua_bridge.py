@@ -15,6 +15,7 @@ def bridge():
         clock = 1000; saved = {}; files = {}; events = {}; listeners = {}; moved = 0; flushed = 0; noFollow = 0; vars = {}
         host = "11111111-1111-1111-1111-111111111111"
         friend = "22222222-2222-2222-2222-222222222222"
+        groups = {[host]="party", [friend]="party"}
         control = {enabled=true,session="",companion=friend,revision=1}
         function entity(uuid,x)
           return {Uuid={EntityUuid=uuid},Transform={Transform={Translate={x,0,0}}},
@@ -42,6 +43,9 @@ def bridge():
           IsDead=function() return 0 end,IsInCombat=function() return 0 end,
           IsEnemy=function() return 0 end,IsInForceTurnBasedMode=function() return 0 end,
           HasNoFollowFlag=function() return noFollow end,SetNoFollowFlag=function(_,value) noFollow=value end,
+          InSamePartyGroup=function(a,b) return groups[a] and groups[a]==groups[b] and 1 or 0 end,
+          DetachFromPartyGroup=function(actor) groups[actor]=actor end,
+          AttachToPartyGroup=function(actor,peer) groups[actor]=groups[peer] end,
           FindValidPosition=function(x,y,z) return x,y,z end,IsInDangerousSurfaceFor=function() return 0 end,
           CharacterMoveToPosition=function() moved=moved+1 end,FlushOsirisQueue=function() flushed=flushed+1 end
         }
@@ -89,26 +93,64 @@ def test_game_rejects_invalid_command(bridge, patch):
 
 def test_pause_cancels_an_existing_move(bridge):
     submit(bridge)
-    assert bridge.globals().noFollow == 1
+    assert bridge.eval('groups[friend] ~= groups[host]')
     bridge.execute('control.enabled=false;clock=clock+800;events.Tick()')
     assert bridge.globals().flushed == 1
-    assert bridge.globals().noFollow == 0
+    assert bridge.eval('groups[friend] == groups[host]')
     assert bridge.globals().saved["BG3Friend/snapshot.json"]["result"]["status"] == "cancelled"
+
+
+def test_arrival_stops_remaining_engine_movement_before_wait_is_completed(bridge):
+    submit(bridge)
+    bridge.execute('entities[friend].Transform.Transform.Translate={1,0,0};clock=clock+800;events.Tick()')
+    g = bridge.globals()
+    assert g.saved["BG3Friend/snapshot.json"]["result"]["status"] == "completed"
+    assert g.flushed == 1
+    submit(bridge, 'command.id="wait2";command.action="wait";command.observed_seq=saved["BG3Friend/snapshot.json"].seq;')
+    assert g.saved["BG3Friend/snapshot.json"]["result"]["status"] == "completed"
+    assert g.moved == 1
+
+
+def test_manual_regrouping_yields_instead_of_fighting_player_choice(bridge):
+    submit(bridge)
+    bridge.execute('groups[friend]=groups[host];clock=clock+800;events.Tick()')
+    g = bridge.globals()
+    state = g.saved["BG3Friend/snapshot.json"]
+    assert state["party_linked"] and not state["independent"]
+    assert state["blocked"] == "party_group_changed"
+    assert state["result"]["status"] == "cancelled"
+    assert g.flushed == 1
+    bridge.execute('clock=clock+800;events.Tick()')
+    assert bridge.eval('groups[friend] == groups[host]')
+    assert not g.saved["BG3Friend/snapshot.json"]["independent"]
+    bridge.execute('control.revision=2;clock=clock+800;events.Tick()')
+    assert g.saved["BG3Friend/snapshot.json"]["independent"]
 
 
 def test_runner_crash_releases_companion_and_stops_move(bridge):
     submit(bridge)
     bridge.execute('clock=clock+5000;events.Tick()')
-    assert bridge.globals().noFollow == 0
+    assert bridge.eval('groups[friend] == groups[host]')
     assert bridge.globals().flushed == 1
     assert bridge.globals().saved["BG3Friend/snapshot.json"]["result"]["status"] == "cancelled"
 
 
-def test_reload_restores_flag_saved_with_ownership(bridge):
+def test_status_publication_pause_releases_control_and_recovery_does_not_replay_command(bridge):
+    submit(bridge)
+    bridge.execute('clock=clock+10000;events.Tick()')
+    g = bridge.globals()
+    assert bridge.eval('groups[friend] == groups[host]') and g.flushed == 1 and g.moved == 1
+    assert not g.saved["BG3Friend/snapshot.json"]["runner_connected"]
+    bridge.execute('files["BG3Friend/runner.json"].updated=clock;clock=clock+800;events.Tick()')
+    assert g.saved["BG3Friend/snapshot.json"]["runner_connected"]
+    assert g.moved == 1  # The unchanged command id cannot revive the cancelled move.
+
+
+def test_reload_restores_party_group_saved_with_ownership(bridge):
     submit(bridge)
     bridge.execute('events.SessionLoaded()')
-    assert bridge.globals().noFollow == 0
-    assert bridge.globals().vars.OwnedFollowFlag is None
+    assert bridge.eval('groups[friend] == groups[host]')
+    assert bridge.globals().vars.OwnedPartyGroup is None
 
 
 def test_preexisting_no_follow_flag_is_preserved(bridge):
@@ -116,6 +158,67 @@ def test_preexisting_no_follow_flag_is_preserved(bridge):
     submit(bridge)
     bridge.execute('control.enabled=false;clock=clock+800;events.Tick()')
     assert bridge.globals().noFollow == 1
+
+
+def test_preexisting_unchained_companion_remains_unchained(bridge):
+    bridge.execute('groups[friend]=friend')
+    submit(bridge)
+    assert bridge.globals().vars.OwnedPartyGroup is None
+    bridge.execute('control.enabled=false;clock=clock+800;events.Tick()')
+    assert bridge.eval('groups[friend] ~= groups[host]')
+
+
+def test_legacy_owned_flag_is_migrated_without_acquiring_deprecated_flags(bridge):
+    bridge.execute('noFollow=1;vars.OwnedFollowFlag={actor=friend};events.SessionLoaded()')
+    assert bridge.globals().noFollow == 0
+    assert bridge.globals().vars.OwnedFollowFlag is None
+    bridge.execute('control.session=BG3Friend.session;files["BG3Friend/runner.json"].session=BG3Friend.session;clock=clock+800;events.Tick()')
+    assert bridge.eval('groups[friend] ~= groups[host]')
+    assert bridge.globals().noFollow == 0
+
+
+@pytest.mark.parametrize('change', [
+    'control.enabled=false;', 'events.SessionLoaded();',
+    'events.GameStateChanged({ToState="Disconnect"});',
+])
+def test_late_party_detach_is_restored_even_after_pause_reload_or_disconnect(bridge, change):
+    bridge.execute('detached=0;Osi.DetachFromPartyGroup=function(actor) detached=detached+1;queued=actor end')
+    submit(bridge)
+    assert bridge.globals().detached == 1
+    assert bridge.globals().moved == 0
+    bridge.execute(change + 'clock=clock+800;events.Tick()')
+    assert bridge.globals().vars.OwnedPartyGroup.releasing[bridge.globals().friend].awaiting_detach
+    bridge.execute('groups[queued]=queued;clock=clock+800;events.Tick()')
+    assert bridge.eval('groups[friend] == groups[host]')
+    assert bridge.globals().vars.OwnedPartyGroup is None
+
+
+def test_party_restore_retries_until_engine_acknowledges_attach(bridge):
+    submit(bridge)
+    bridge.execute('attaches=0;Osi.AttachToPartyGroup=function() attaches=attaches+1 end;control.enabled=false;clock=clock+800;events.Tick()')
+    assert bridge.globals().vars.OwnedPartyGroup.releasing[bridge.globals().friend]
+    bridge.execute('Osi.AttachToPartyGroup=function(actor,peer) groups[actor]=groups[peer] end;clock=clock+800;events.Tick()')
+    assert bridge.eval('groups[friend] == groups[host]')
+    assert bridge.globals().vars.OwnedPartyGroup is None
+
+
+def test_return_respects_manual_regrouping_to_a_different_group(bridge):
+    submit(bridge)
+    bridge.execute('''
+      other="33333333-3333-3333-3333-333333333333"
+      entities[other]=entity(other,3);groups[other]=other;groups[friend]=other
+      Osi.DB_PartyMembers.Get=function() return {{host},{friend},{other}} end
+      control.enabled=false;clock=clock+800;events.Tick()
+    ''')
+    assert bridge.eval('groups[friend] == groups[other] and groups[friend] ~= groups[host]')
+    assert bridge.globals().vars.OwnedPartyGroup is None
+
+
+def test_unknown_party_group_cannot_claim_independent_control(bridge):
+    bridge.execute('Osi.InSamePartyGroup=function() error("unavailable") end')
+    submit(bridge)
+    assert bridge.globals().moved == 0
+    assert not bridge.globals().saved["BG3Friend/snapshot.json"]["independent"]
 
 
 def test_camp_routines_keep_movement_control(bridge):
@@ -284,9 +387,11 @@ def test_missing_host_snapshot_cannot_prevent_lease_cleanup(bridge, kind):
         assert not g.statuses[g.friend]
         assert g.vars.OwnedCombat is None
     else:
-        assert g.noFollow == 0
-        assert g.vars.OwnedFollowFlag is None
+        assert g.vars.OwnedPartyGroup.releasing[g.friend]
         assert g.flushed == 1
+        bridge.execute('entities[host]=entity(host,0);clock=clock+800;events.Tick()')
+        assert bridge.eval('groups[friend] == groups[host]')
+        assert g.vars.OwnedPartyGroup is None
 
 
 def test_follow_return_retries_after_missing_entity_and_lua_reload(bridge):
@@ -295,11 +400,11 @@ def test_follow_return_retries_after_missing_entity_and_lua_reload(bridge):
       savedEntity=entities[friend];entities[friend]=nil
       control.enabled=false;clock=clock+800;events.Tick()
     ''')
-    assert bridge.globals().vars.OwnedFollowFlag.releasing[bridge.globals().friend]
+    assert bridge.globals().vars.OwnedPartyGroup.releasing[bridge.globals().friend]
     bridge.execute(SOURCE.read_text(encoding="utf-8"))
     bridge.execute('events.SessionLoaded();entities[friend]=savedEntity;clock=clock+800;events.Tick()')
-    assert bridge.globals().noFollow == 0
-    assert bridge.globals().vars.OwnedFollowFlag is None
+    assert bridge.eval('groups[friend] == groups[host]')
+    assert bridge.globals().vars.OwnedPartyGroup is None
 
 
 def test_reassignment_preserves_cleanup_for_the_unavailable_old_actor(bridge):

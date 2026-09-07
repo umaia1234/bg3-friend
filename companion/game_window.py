@@ -22,6 +22,8 @@ class GameWindow:
         u.IsIconic.argtypes = u.IsWindow.argtypes = u.IsWindowVisible.argtypes = [w.HWND]
         u.SetForegroundWindow.argtypes = [w.HWND]
         u.GetWindowTextW.argtypes = [w.HWND, w.LPWSTR, c.c_int]
+        u.SetWindowTextW.argtypes = [w.HWND, w.LPCWSTR]
+        u.SetWindowTextW.restype = w.BOOL
         u.GetWindowLongPtrW.argtypes = [w.HWND, c.c_int]
         u.GetWindowLongPtrW.restype = c.c_ssize_t
         u.SetWindowLongPtrW.argtypes = [w.HWND, c.c_int, c.c_ssize_t]
@@ -73,9 +75,13 @@ class GameWindow:
         if not self.user:
             return
         handle = self.user.GetAncestor(widget.winfo_id(), 2)
+        # Tk's override-redirect wrapper has no native caption. Keep the HUD
+        # borderless, but expose its real title and an ordinary application
+        # window so accessibility tools can select the chat independently.
+        self.user.SetWindowTextW(handle, widget.title())
         style = self.user.GetWindowLongPtrW(handle, -20)
-        self.user.SetWindowLongPtrW(handle, -20, (style | 0x80) & ~0x40000)
-        self.user.SetWindowPos(handle, -1, 0, 0, 0, 0, 0x13)
+        self.user.SetWindowLongPtrW(handle, -20, (style | 0x40000) & ~0x80)
+        self.user.SetWindowPos(handle, -1, 0, 0, 0, 0, 0x33)
 
 
 def enable_dpi_awareness():

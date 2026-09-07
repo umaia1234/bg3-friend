@@ -1,17 +1,21 @@
 import copy
 import json
 from concurrent.futures import CancelledError, Future
+from contextlib import contextmanager
+import os
 from pathlib import Path
 import subprocess
 import sys
 import textwrap
 import threading
+import time
+from types import SimpleNamespace
 
 import pytest
 
 from companion.protocol import command_for, validate_decision, write_json, read_json
 from companion.model import ReplayModel
-from companion.runner import Runner
+from companion.runner import BridgeIOError, Runner
 
 
 def scene():
@@ -365,3 +369,231 @@ def test_uncancellable_fixture_cannot_keep_stopped_runner_process_alive(tmp_path
     completed = subprocess.run([sys.executable, str(script), str(tmp_path), str(Path(__file__).parents[1])], capture_output=True,
                                text=True, timeout=4, check=True, cwd=Path(__file__).parents[1])
     assert completed.stdout.strip() == "stopped"
+
+
+@contextmanager
+def windows_reader_without_delete_sharing(path):
+    """A real Windows reader permits reads/writes but blocks atomic replacement."""
+    import ctypes as C
+    from ctypes import wintypes as W
+    api = C.WinDLL("kernel32", use_last_error=True)
+    api.CreateFileW.argtypes = [W.LPCWSTR, W.DWORD, W.DWORD, C.c_void_p, W.DWORD, W.DWORD, W.HANDLE]
+    api.CreateFileW.restype = W.HANDLE
+    api.CloseHandle.argtypes = [W.HANDLE]
+    api.CloseHandle.restype = W.BOOL
+    handle = api.CreateFileW(str(path), 0x80000000, 0x1 | 0x2, None, 3, 0x80, None)
+    if handle == C.c_void_p(-1).value:
+        raise C.WinError(C.get_last_error())
+    try:
+        yield
+    finally:
+        assert api.CloseHandle(handle)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Real Windows non-delete-sharing file handle")
+def test_locked_atomic_command_preserves_the_previous_complete_document(tmp_path):
+    path = tmp_path / "command.json"
+    original = command_for(decision("wait", ""), scene(), 1)
+    write_json(path, original)
+    before = path.read_bytes()
+    started = time.monotonic()
+    with windows_reader_without_delete_sharing(path):
+        with pytest.raises(PermissionError) as failure:
+            write_json(path, original | {"id": "new-command", "session": "other"})
+        assert failure.value.winerror in (5, 32, 33)
+        assert path.read_bytes() == before
+    assert time.monotonic() - started < 2
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Real Windows non-delete-sharing file handle")
+def test_runner_survives_a_windows_reader_holding_status_past_the_short_retry(tmp_path):
+    runner = Runner(tmp_path, ReplayModel())
+    path = tmp_path / "runner.json"
+    original = {"runner": "waiting_game", "updated": 0}
+    write_json(path, original)
+    stop, failures = threading.Event(), []
+
+    def run():
+        try:
+            runner.run(SimpleNamespace(exists=stop.is_set))
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=run, daemon=True)
+    try:
+        with windows_reader_without_delete_sharing(path):
+            worker.start()
+            time.sleep(1.2)
+            assert worker.is_alive(), repr(failures)
+            assert read_json(path) == original
+            assert runner.calls == 0
+        deadline = time.monotonic() + 3
+        latest = None
+        while time.monotonic() < deadline:
+            latest = read_json(path)
+            if latest and latest.get("updated") != 0:
+                break
+            time.sleep(.02)
+        assert latest and latest.get("updated") != 0
+        assert worker.is_alive() and not failures
+    finally:
+        stop.set()
+        worker.join(4)
+    assert not worker.is_alive() and not failures
+    assert read_json(path)["runner"] == "stopped"
+
+
+@pytest.mark.parametrize("steer", ["reload", "reassign", "pause", "combat_round_trip"])
+def test_status_recovery_discards_cancelled_decision_and_rechecks_current_context(tmp_path, monkeypatch, steer):
+    model = CancellableFixture()
+    runner = start_runner(tmp_path, model, max_calls=2, interval=0)
+    old_command = command_for(decision("wait", ""), scene(), 1)
+    write_json(tmp_path / "command.json", old_command)
+    locked = [True]
+    original = write_json
+
+    def status_contention(path, value):
+        if path.name == "runner.json" and locked[0]:
+            raise PermissionError("fixture reader has not released the file")
+        return original(path, value)
+
+    monkeypatch.setattr("companion.runner.write_json", status_contention)
+    try:
+        runner.tick()
+        assert model.started.wait(2)
+        assert runner.publish_status() is False
+        assert model.cancel_event.is_set() and model.cancel_requests == 1
+        state, control = scene(), read_json(tmp_path / "control.json")
+        if steer == "reload":
+            state["session"] = control["session"] = "s2"
+        elif steer == "reassign":
+            state["companion"]["id"] = control["companion"] = "other"
+        elif steer == "pause":
+            control["enabled"] = False
+        else:
+            write_json(tmp_path / "snapshot.json", state | {"blocked": "combat"})
+            runner.tick()
+        if steer != "combat_round_trip":
+            control["revision"] = 2
+        state["control_revision"] = control["revision"]
+        state["seq"] += 1
+        write_json(tmp_path / "control.json", control)
+        write_json(tmp_path / "snapshot.json", state)
+        runner.tick()
+        runner.tick()
+        assert runner.calls == 1 and model.invocations == 1
+        assert read_json(tmp_path / "command.json") == old_command
+        model.release.set()
+        with pytest.raises(CancelledError):
+            runner.pending.result(timeout=2)
+        locked[0] = False
+        assert runner.publish_status() is True
+        runner.tick()
+        assert read_json(tmp_path / "command.json") == old_command
+        if steer == "pause":
+            assert runner.calls == 1 and runner.pending is None
+        else:
+            runner.pending.result(timeout=2)
+            runner.tick()
+            command = read_json(tmp_path / "command.json")
+            assert command["id"] != old_command["id"]
+            assert (command["session"], command["actor"], command["control_revision"], command["observed_seq"]) == (
+                state["session"], state["companion"]["id"], control["revision"], state["seq"])
+            assert runner.calls == 2 and model.maximum_active == 1
+    finally:
+        model.release.set()
+        runner.pool.shutdown()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Real Windows non-delete-sharing file handle")
+def test_permanent_status_lock_stops_with_a_safe_error_and_returns_control(tmp_path):
+    runner = start_runner(tmp_path, max_calls=1)
+    runner.STATUS_WRITE_GRACE = .3
+    path = tmp_path / "runner.json"
+    write_json(path, {"runner": "ready", "session": "s1", "updated": 0})
+    started = time.monotonic()
+    with windows_reader_without_delete_sharing(path):
+        with pytest.raises(BridgeIOError) as failure:
+            runner.run()
+    assert time.monotonic() - started < 3
+    assert failure.value.code == "local_io_failed" and str(tmp_path) not in str(failure.value)
+    assert not read_json(tmp_path / "control.json")["enabled"]
+    assert runner.stopping and runner.pool.closed
+    assert not (tmp_path / "command.json").exists()
+
+
+def test_nonpermission_status_error_is_not_silently_retried(tmp_path, monkeypatch):
+    runner = start_runner(tmp_path, max_calls=1)
+    original, writes = write_json, []
+
+    def full_disk(path, value):
+        if path.name == "runner.json":
+            writes.append(value["runner"])
+            raise OSError(28, "private fixture disk path")
+        return original(path, value)
+
+    monkeypatch.setattr("companion.runner.write_json", full_disk)
+    with pytest.raises(BridgeIOError) as failure:
+        runner.run()
+    assert writes[-1] == "stopped" and len(writes) == 2
+    assert "private" not in str(failure.value)
+    assert not read_json(tmp_path / "control.json")["enabled"]
+    assert runner.pool.closed
+
+
+def test_failed_control_return_does_not_prevent_stopped_status_and_worker_cleanup(tmp_path, monkeypatch):
+    runner = start_runner(tmp_path)
+    runner.session = "s1"
+    original = write_json
+
+    def blocked_control(path, value):
+        if path.name == "control.json":
+            raise PermissionError("private fixture control path")
+        return original(path, value)
+
+    monkeypatch.setattr("companion.runner.write_json", blocked_control)
+    with pytest.raises(BridgeIOError):
+        runner.run(SimpleNamespace(exists=lambda: True))
+    assert read_json(tmp_path / "runner.json")["runner"] == "stopped"
+    assert runner.pool.closed
+
+
+def test_waiting_agreement_is_validated_before_atomic_command_publication(tmp_path):
+    runner = start_runner(tmp_path, max_calls=1)
+    try:
+        runner.tick()
+        runner.pending.result(timeout=2)
+        runner.director.stance = "hold"
+        runner.pending = Future()
+        runner.pending.set_result((decision("approach", "box"), 0))
+        runner.tick()
+        assert not (tmp_path / "command.json").exists()
+        assert runner.director.stance == "hold"
+        assert runner.status["runner"] == "error"
+    finally:
+        runner.pool.shutdown()
+
+
+def test_blocked_command_publication_does_not_commit_the_new_plan(tmp_path, monkeypatch):
+    runner = start_runner(tmp_path, max_calls=1)
+    original = write_json
+
+    def blocked_command(path, value):
+        if path.name == "command.json":
+            raise PermissionError("fixture command reader")
+        return original(path, value)
+
+    monkeypatch.setattr("companion.runner.write_json", blocked_command)
+    try:
+        runner.tick()
+        runner.pending.result(timeout=2)
+        runner.director.stance = "scout"
+        runner.pending = Future()
+        runner.pending.set_result((decision("wait", "") | {"stance": "hold"}, 0))
+        runner.tick()
+        assert not (tmp_path / "command.json").exists()
+        assert runner.director.stance == "scout"
+        assert runner.command_pending is None
+    finally:
+        runner.pool.shutdown()

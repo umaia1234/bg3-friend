@@ -66,7 +66,16 @@ class _DecisionWorker:
 _UNOBSERVED = object()
 
 
+class BridgeIOError(RuntimeError):
+    code = "local_io_failed"
+
+    def __init__(self):
+        super().__init__("게임 연결 파일을 갱신하지 못해 대화를 중지했습니다. 쓰기 권한과 파일을 사용 중인 프로그램을 확인한 뒤 다시 연결해 주세요.")
+
+
 class Runner:
+    STATUS_WRITE_GRACE = 10.0
+
     def __init__(self, folder: Path, model, interval: float = 15, max_calls: int = 0):
         self.folder = folder
         self.model = model
@@ -95,6 +104,7 @@ class Runner:
         self.failures = 0
         self.failure_blocked = False
         self.stopping = False
+        self.status_write_blocked = None
         self.pool = _DecisionWorker()
         self.status = {"runner": "waiting_game", "model": model.model, "calls": 0}
         self.folder.mkdir(parents=True, exist_ok=True)
@@ -187,7 +197,7 @@ class Runner:
         return changed
 
     def tick(self) -> None:
-        if self.stopping:
+        if self.stopping or self.status_write_blocked is not None:
             return
         now = time.monotonic()
         snapshot = read_json(self.folder / "snapshot.json")
@@ -269,9 +279,11 @@ class Runner:
                     decision, latency = future.result()
                     self.status["last_latency_seconds"] = round(latency, 2)
                     validate_decision(decision, snapshot)
-                    self.director.apply(decision, context.get("human_message", False))
+                    next_director = copy.deepcopy(self.director)
+                    next_director.apply(decision, context.get("human_message", False))
                     command = command_for(decision, snapshot, revision)
                     write_json(self.folder / "command.json", command)
+                    self.director = next_director
                     self.command_pending = command | {"sent": now}
                     self.unanswered = False
                     if decision["say"]:
@@ -343,7 +355,30 @@ class Runner:
         self.last_ask = now
         self.status["runner"] = "thinking"
 
+    def publish_status(self) -> bool:
+        # Only heartbeat/state publication can be rebuilt and retried here. Never
+        # queue a command or replay a serialized decision across this pause.
+        status = self.status | {"updated": time.time()}
+        if self.status_write_blocked is not None:
+            status.update(runner="retrying", error_code="local_io_failed",
+                          error="게임 연결 파일이 사용 중입니다. 판단을 멈추고 연결 복구를 기다립니다.")
+        try:
+            write_json(self.folder / "runner.json", status)
+        except PermissionError as exc:
+            now = time.monotonic()
+            if self.status_write_blocked is None:
+                self.status_write_blocked = now
+                self.invalidate_pending()
+            if now - self.status_write_blocked >= self.STATUS_WRITE_GRACE:
+                raise BridgeIOError() from exc
+            return False
+        except OSError as exc:
+            raise BridgeIOError() from exc
+        self.status_write_blocked = None
+        return True
+
     def run(self, stop_file: Path | None = None) -> None:
+        failure = None
         try:
             while True:
                 if stop_file and stop_file.exists():
@@ -352,23 +387,34 @@ class Runner:
                     self.tick()
                 except Exception as exc:
                     self.status.update(runner="error", error=str(exc)[:250])
-                write_json(self.folder / "runner.json", self.status)
+                self.publish_status()
                 time.sleep(0.35)
+        except BaseException as exc:
+            failure = exc
+            raise
         finally:
             self.stopping = True
             self.invalidate_pending()
             self.pool.shutdown(wait=False, cancel_futures=True)
+            cleanup_error = None
             try:
                 control = read_json(self.folder / "control.json") or {}
                 if control.get("session") == self.session and control.get("enabled"):
                     control.update(enabled=False, revision=control.get("revision", 0) + 1)
                     write_json(self.folder / "control.json", control)
+            except (OSError, ValueError, TypeError) as exc:
+                cleanup_error = exc
+            try:
                 self.status["runner"] = "stopped"
                 write_json(self.folder / "runner.json", self.status)
+            except OSError as exc:
+                cleanup_error = cleanup_error or exc
             finally:
                 # Give a cancellable model time to reap its owned subprocess. A model
                 # without cancellation support cannot delay process exit indefinitely.
                 self.pool.shutdown(wait=True, timeout=2.5)
+            if cleanup_error is not None and failure is None:
+                raise BridgeIOError() from cleanup_error
 
 
 def main() -> None:

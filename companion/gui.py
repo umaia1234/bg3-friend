@@ -315,7 +315,8 @@ class FriendWindow:
         connected = file_age(self.folder / 'runner.json') < 8 and runner.get('runner') != 'stopped'
         waiting = self.waiting_introduction(control) if not active else None
         self.heading.configure(text='파티  ·  ' + (waiting['name'] if waiting else self.members.get(self.choice, '동료')))
-        self.dot.configure(fg='#96bb8a' if active and connected else MUTED)
+        manually_grouped = snapshot.get('blocked') == 'party_group_changed'
+        self.dot.configure(fg='#96bb8a' if active and connected and not manually_grouped else MUTED)
         hint = ''
         if not connected:
             hint = '연결 끊김'
@@ -329,6 +330,8 @@ class FriendWindow:
             hint = '합류 기다리는 중'
         elif not active:
             hint = '쉬는 중'
+        elif manually_grouped:
+            hint = '파티 연결 변경 · 직접 조작 중'
         elif runner.get('runner') == 'thinking':
             hint = '···'
         self.hint.configure(text=hint)

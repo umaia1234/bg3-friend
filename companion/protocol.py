@@ -24,6 +24,17 @@ DECISION_SCHEMA = {
 }
 
 
+class AtomicWriteBusy(PermissionError):
+    """The destination was not replaced; its previous complete JSON is intact."""
+    code = "local_io_failed"
+    retryable = True
+
+    def __init__(self, path: Path, cause: PermissionError):
+        super().__init__("게임 연결 파일을 교체하지 못했습니다. 파일을 사용 중인 작업이 끝나면 다시 시도합니다.")
+        self.path = path
+        self.winerror = getattr(cause, "winerror", None)
+
+
 def read_json(path: Path) -> dict | None:
     try:
         value = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -44,9 +55,9 @@ def write_json(path: Path, value: dict) -> None:
             try:
                 os.replace(temp, path)
                 break
-            except PermissionError:
+            except PermissionError as exc:
                 if attempt == 6:
-                    raise
+                    raise AtomicWriteBusy(path, exc) from exc
                 time.sleep(.005 * 2 ** attempt)
     finally:
         temp.unlink(missing_ok=True)
