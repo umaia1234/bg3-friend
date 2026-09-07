@@ -13,12 +13,12 @@ __pycache__/
 .env.*
 !.env.example
 config.local.json
+project.local.json
 *.log
 
 # Local conversations, observations, screenshots, save/installation backups.
 /memory/
 /docs/evidence/
-/AGENTS.md
 /CLAUDE.md
 /.claude/
 /.codex/
