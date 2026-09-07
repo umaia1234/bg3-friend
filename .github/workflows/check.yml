@@ -1,0 +1,96 @@
+name: Offline and portable-runtime checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Prepare offline test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+          python -m pip install -e '.[test]'
+      - name: Python and mocked Lua regression suite
+        run: python -m pytest -q
+      - name: Compile public runtime and commands
+        run: python -m compileall -q companion scripts
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: x64
+      - name: Prepare test and pinned build dependencies
+        run: python -m pip install -e '.[test]' 'PyInstaller==6.22.2'
+      - name: Native Python offline regression suite
+        run: python -m pytest -q
+      - name: Compile public runtime and commands
+        run: python -m compileall -q companion scripts
+      - name: Prepare runtime-only PAK fixture and matching Tcl notice
+        shell: python
+        run: |
+          from pathlib import Path
+          import tkinter
+          import urllib.request
+          folder = Path('.runtime/ci')
+          folder.mkdir(parents=True, exist_ok=True)
+          (folder / 'BG3Friend.pak').write_bytes(b'LSPK\x12\x00\x00\x00CI runtime fixture, not a game package')
+          version = str(tkinter.Tcl().call('info', 'patchlevel'))
+          tag = 'core-' + version.replace('.', '-')
+          url = 'https://raw.githubusercontent.com/tcltk/tcl/' + tag + '/license.terms'
+          with urllib.request.urlopen(url, timeout=30) as response:
+              (folder / 'Tcl-license.terms').write_bytes(response.read())
+      - name: Build unsigned runtime-only portable fixture
+        run: >-
+          python scripts/build_release.py
+          --package .runtime/ci/BG3Friend.pak
+          --fixture-package
+          --license-file Tcl=.runtime/ci/Tcl-license.terms
+          --output-dir .runtime/ci/output
+      - name: Verify ZIP checksum, unpack elsewhere and exercise frozen Tk entry
+        shell: python
+        run: |
+          from pathlib import Path
+          import hashlib
+          import json
+          import subprocess
+          import zipfile
+          folder = Path('.runtime/ci').resolve()
+          expected, filename = (folder / 'output/SHA256SUMS').read_text().strip().split('  ', 1)
+          archive = folder / 'output' / filename
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == expected
+          target = folder / 'relocated Korean 사용자 runtime'
+          with zipfile.ZipFile(archive) as bundle:
+              assert bundle.testzip() is None
+              bundle.extractall(target)
+          executable = target / 'BG3Friend/BG3Friend.exe'
+          report = folder / 'smoke.json'
+          subprocess.run([str(executable), '--smoke-test', '--report', str(report), '--config-root', str(folder / 'isolated-config')], check=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+          result = json.loads(report.read_text(encoding='utf-8'))
+          assert result['ok'] and result['frozen'] and result['tk']
+          manifest = json.loads((target / 'BG3Friend/_internal/bundle/manifest.json').read_text(encoding='utf-8'))
+          assert manifest['fixture'] is True
+          assert result['package_sha256'] == manifest['package']['sha256']
+          assert not (folder / 'isolated-config/settings.json').exists()
+    # The synthetic package is never installed, released, or uploaded as an artifact.

@@ -1,6 +1,6 @@
 interface:
   display_name: "발더스 3 함께하기"
-  short_description: "빠진 설정을 먼저 확인하고 게임·세이브·동료 채팅까지 준비합니다"
+  short_description: "Windows 앱 설정부터 게임·세이브·동료 채팅까지 준비합니다"
   default_prompt: "$bg3-friend-start로 발더스3 하자. 필요한 설정은 먼저 물어보고 화면에서 준비해 주세요."
 policy:
   allow_implicit_invocation: true

@@ -88,24 +88,66 @@ local function cancel(detail)
         finish("cancelled", detail)
     end
 end
-local function release()
+local function ownership(name)
     local vars = Ext.Vars.GetModVariables(MOD_UUID)
-    local owned = vars.OwnedFollowFlag
-    if owned and Ext.Entity.Get(owned.actor) then
-        -- Only restore the flag we changed; preserve an already ungrouped companion.
-        if query("HasNoFollowFlag", owned.actor) == 1 then query("SetNoFollowFlag", owned.actor, 0) end
-        vars.OwnedFollowFlag = nil
+    local owned = vars[name] or {}
+    owned.releasing = owned.releasing or {}
+    return vars, owned
+end
+local function save_ownership(vars, name, owned)
+    -- Reassign the table so pending restoration is also persisted in a save.
+    vars[name] = (owned.actor or next(owned.releasing)) and owned or nil
+end
+local function restore_follow()
+    local vars, owned = ownership("OwnedFollowFlag")
+    for actor in pairs(owned.releasing) do
+        if Ext.Entity.Get(actor) then
+            local flag = query("HasNoFollowFlag", actor)
+            if flag == 1 then
+                query("SetNoFollowFlag", actor, 0)
+                flag = query("HasNoFollowFlag", actor)
+            end
+            if flag == 0 then owned.releasing[actor] = nil end
+        end
     end
+    save_ownership(vars, "OwnedFollowFlag", owned)
+end
+local function release()
+    local vars, owned = ownership("OwnedFollowFlag")
+    if owned.actor then
+        owned.releasing[owned.actor] = true
+        owned.actor = nil
+    end
+    save_ownership(vars, "OwnedFollowFlag", owned)
     B.held = nil
+    restore_follow()
+end
+local function restore_combat()
+    local vars, owned = ownership("OwnedCombat")
+    for actor, pending in pairs(owned.releasing) do
+        if Ext.Entity.Get(actor) then
+            local active = query("HasActiveStatus", actor, COMBAT_STATUS)
+            if active == 1 then
+                pending.awaiting_apply = false
+                query("RemoveStatus", actor, COMBAT_STATUS)
+                active = query("HasActiveStatus", actor, COMBAT_STATUS)
+            end
+            -- An absent status does not acknowledge a queued ApplyStatus. Retain the
+            -- cancellation until its application is observed, including across reloads.
+            if active == 0 and not pending.awaiting_apply then owned.releasing[actor] = nil end
+        end
+    end
+    save_ownership(vars, "OwnedCombat", owned)
 end
 local function release_combat()
-    local vars = Ext.Vars.GetModVariables(MOD_UUID)
-    local owned = vars.OwnedCombat
-    if owned and Ext.Entity.Get(owned.actor) then
-        query("RemoveStatus", owned.actor, COMBAT_STATUS)
-        vars.OwnedCombat = nil
+    local vars, owned = ownership("OwnedCombat")
+    if owned.actor then
+        owned.releasing[owned.actor] = {awaiting_apply=owned.awaiting_apply ~= false}
+        owned.actor = nil; owned.awaiting_apply = nil
     end
-    B.fighting = nil; B.combatActor = nil; B.combatApplyAt = nil
+    save_ownership(vars, "OwnedCombat", owned)
+    B.fighting = nil; B.combatActor = nil
+    restore_combat()
 end
 local function sync_combat(state, control)
     -- Automatic turn focus is not a request to take control. Manual takeover is the chat menu.
@@ -115,18 +157,29 @@ local function sync_combat(state, control)
         and not state.companion.dead and not next(B.dialogs)
     local actor = take and state.companion.id or nil
     if actor ~= B.combatActor then release_combat() end
-    -- ApplyStatus is queued by the engine; same-tick HasActiveStatus may still be false.
-    -- Retain acquisition across ticks instead of removing the freshly applied status.
     B.combatActor = actor
-    if actor and query("HasActiveStatus", actor, COMBAT_STATUS) ~= 1
-        and (not B.combatApplyAt or now()-B.combatApplyAt > 2000) then
-        Ext.Vars.GetModVariables(MOD_UUID).OwnedCombat = {actor=actor}
-        B.combatApplyAt = now()
-        query("ApplyStatus", actor, COMBAT_STATUS, -1.0, 1, actor)
+    local vars, owned = ownership("OwnedCombat")
+    -- A new request for the same actor may adopt our still-pending acquisition.
+    if actor and owned.releasing[actor] then
+        owned.actor = actor; owned.awaiting_apply = owned.releasing[actor].awaiting_apply
+        owned.releasing[actor] = nil
     end
-    B.fighting = actor and query("HasActiveStatus", actor, COMBAT_STATUS) == 1 and actor or nil
+    local active = actor and query("HasActiveStatus", actor, COMBAT_STATUS) or nil
+    if actor and active == 0 and not owned.awaiting_apply then
+        -- Never queue another application while the preceding one is unobserved.
+        -- Multiple delayed applications could otherwise outlive a confirmed removal.
+        owned.actor = actor; owned.awaiting_apply = true
+        save_ownership(vars, "OwnedCombat", owned)
+        local ok = pcall(Osi.ApplyStatus, actor, COMBAT_STATUS, -1.0, 1, actor)
+        if not ok then owned.awaiting_apply = false end
+        active = query("HasActiveStatus", actor, COMBAT_STATUS)
+    end
+    if actor and owned.actor == actor and active == 1 then owned.awaiting_apply = false end
+    save_ownership(vars, "OwnedCombat", owned)
+    B.fighting = actor and owned.actor == actor and active == 1 and actor or nil
+    local returning = state.companion and owned.releasing[state.companion.id]
     state.combat = {active=state.companion and state.companion.in_combat or false,
-        controller=B.fighting and "game_ai" or "player", actor=B.fighting,
+        controller=B.fighting and "game_ai" or (returning and "releasing" or "player"), actor=B.fighting,
         events=B.events}
 end
 local function sync_control(state, control)
@@ -143,9 +196,11 @@ local function sync_control(state, control)
         release()
         if actor then
             local old = query("HasNoFollowFlag", actor)
-            if old == 0 then
-                Ext.Vars.GetModVariables(MOD_UUID).OwnedFollowFlag = {actor=actor}
-                query("SetNoFollowFlag", actor, 1)
+            local vars, owned = ownership("OwnedFollowFlag")
+            if old == 0 or (old == 1 and owned.releasing[actor]) then
+                owned.actor = actor; owned.releasing[actor] = nil
+                save_ownership(vars, "OwnedFollowFlag", owned)
+                if old == 0 then query("SetNoFollowFlag", actor, 1) end
             end
             if query("HasNoFollowFlag", actor) == 1 then B.held = actor end
         end
@@ -305,10 +360,18 @@ local function execute(command, state, control)
     B.result = {id=command.id,status="dispatched",detail="이동을 시작했어. 도착 여부를 확인 중이야."}
 end
 local function tick()
-    if B.session == "" or now()-B.tick < 750 then return end
-    B.tick = now(); B.seq = B.seq+1
+    if now()-B.tick < 750 then return end
+    B.tick = now()
+    -- Cleanup cannot depend on a readable host/party snapshot or a live session.
+    restore_follow(); restore_combat()
+    if B.session == "" then return end
+    B.seq = B.seq+1
     local state, control = snapshot()
-    if not state then return end
+    if not state then
+        cancel("게임 상태를 확인할 수 없어 이동을 멈췄어.")
+        release(); release_combat()
+        return
+    end
     introductions(state,control)
     sync_control(state,control)
     if B.active then

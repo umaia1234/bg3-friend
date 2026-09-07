@@ -47,7 +47,7 @@ def bridge():
         }
         files["BG3Friend/control.json"] = control
     ''')
-    lua.execute(SOURCE.read_text())
+    lua.execute(SOURCE.read_text(encoding="utf-8"))
     lua.execute('''events.SessionLoaded(); events.Tick(); state=saved["BG3Friend/snapshot.json"]; control.session=state.session
       files["BG3Friend/runner.json"]={session=state.session,updated=1000,runner="ready"}
     ''')
@@ -177,6 +177,166 @@ def test_delayed_engine_status_application_does_not_churn_control(bridge):
     assert bridge.globals().saved['BG3Friend/snapshot.json']['combat']['controller'] == 'game_ai'
     bridge.execute('control.enabled=false;clock=clock+800;events.Tick()')
     assert bridge.globals().removed == 1
+
+
+def delayed_combat(bridge):
+    bridge.execute('''
+      statuses={}; applied=0; removed=0
+      Osi.IsInCombat=function() return 1 end
+      Osi.HasActiveStatus=function(actor) return statuses[actor] and 1 or 0 end
+      Osi.ApplyStatus=function(actor) applied=applied+1;queued=actor end
+      Osi.RemoveStatus=function(actor) removed=removed+1;statuses[actor]=nil end
+      clock=clock+800;events.Tick()
+    ''')
+
+
+@pytest.mark.parametrize('change', [
+    'control.enabled=false;', 'control.auto_combat=false;',
+    'listeners.DialogStarted("cutscene",77);', 'clock=clock+5000;',
+    'events.SessionLoaded();',
+])
+def test_late_status_application_after_return_is_still_removed(bridge, change):
+    delayed_combat(bridge)
+    bridge.execute(change + 'clock=clock+800;events.Tick()')
+    g = bridge.globals()
+    assert g.vars.OwnedCombat.releasing[g.friend].awaiting_apply
+    assert not g.statuses[g.friend]
+    bridge.execute('statuses[queued]=true;clock=clock+800;events.Tick()')
+    assert not g.statuses[g.friend]
+    assert g.vars.OwnedCombat is None
+    assert g.removed == 1
+
+
+def test_unobserved_acquisition_never_queues_duplicate_statuses(bridge):
+    delayed_combat(bridge)
+    bridge.execute('''
+      for i=1,8 do
+        clock=clock+800;files["BG3Friend/runner.json"].updated=clock;events.Tick()
+      end
+    ''')
+    assert bridge.globals().applied == 1
+    bridge.execute('statuses[queued]=true;clock=clock+800;events.Tick()')
+    assert bridge.globals().saved['BG3Friend/snapshot.json']['combat']['controller'] == 'game_ai'
+
+
+def test_missing_companion_return_survives_lua_reload_and_entity_restoration(bridge):
+    combat(bridge)
+    bridge.execute('''
+      savedEntity=entities[friend];entities[friend]=nil
+      control.enabled=false;clock=clock+800;events.Tick()
+    ''')
+    assert bridge.globals().vars.OwnedCombat.releasing[bridge.globals().friend]
+    # Recreate the script's local state while preserving only the fake save variables.
+    bridge.execute(SOURCE.read_text(encoding="utf-8"))
+    bridge.execute('events.SessionLoaded();clock=clock+800;events.Tick()')
+    assert bridge.globals().vars.OwnedCombat.releasing[bridge.globals().friend]
+    bridge.execute('entities[friend]=savedEntity;clock=clock+800;events.Tick()')
+    g = bridge.globals()
+    assert not g.statuses[g.friend]
+    assert g.vars.OwnedCombat is None
+    assert list(g.removed.values()) == [g.friend]
+
+
+def test_unobserved_application_cancellation_survives_lua_reload(bridge):
+    delayed_combat(bridge)
+    bridge.execute('control.enabled=false;clock=clock+800;events.Tick()')
+    bridge.execute(SOURCE.read_text(encoding="utf-8"))
+    bridge.execute('events.SessionLoaded();statuses[queued]=true;clock=clock+800;events.Tick()')
+    g = bridge.globals()
+    assert not g.statuses[g.friend]
+    assert g.vars.OwnedCombat is None
+    assert g.removed == 1
+
+
+@pytest.mark.parametrize('mode', ['raises', 'delayed'])
+def test_removal_is_retried_until_the_engine_reports_absence(bridge, mode):
+    combat(bridge)
+    bridge.execute('''
+      attempts=0
+      Osi.RemoveStatus=function(actor)
+        attempts=attempts+1
+    ''' + ('error("engine not ready")' if mode == 'raises' else 'removing=actor') + '''
+      end
+      control.enabled=false;clock=clock+800;events.Tick()
+    ''')
+    g = bridge.globals()
+    assert g.statuses[g.friend]
+    assert g.vars.OwnedCombat.releasing[g.friend]
+    assert g.saved['BG3Friend/snapshot.json']['combat']['controller'] == 'releasing'
+    bridge.execute('''
+      Osi.RemoveStatus=function(actor) attempts=attempts+1;statuses[actor]=nil end
+      clock=clock+800;events.Tick()
+    ''')
+    assert not g.statuses[g.friend]
+    assert g.vars.OwnedCombat is None
+    assert g.attempts >= 2
+
+
+@pytest.mark.parametrize('kind', ['combat', 'follow'])
+def test_missing_host_snapshot_cannot_prevent_lease_cleanup(bridge, kind):
+    if kind == 'combat':
+        combat(bridge)
+    else:
+        submit(bridge)
+    bridge.execute('entities[host]=nil;clock=clock+5000;events.Tick()')
+    g = bridge.globals()
+    if kind == 'combat':
+        assert not g.statuses[g.friend]
+        assert g.vars.OwnedCombat is None
+    else:
+        assert g.noFollow == 0
+        assert g.vars.OwnedFollowFlag is None
+        assert g.flushed == 1
+
+
+def test_follow_return_retries_after_missing_entity_and_lua_reload(bridge):
+    submit(bridge)
+    bridge.execute('''
+      savedEntity=entities[friend];entities[friend]=nil
+      control.enabled=false;clock=clock+800;events.Tick()
+    ''')
+    assert bridge.globals().vars.OwnedFollowFlag.releasing[bridge.globals().friend]
+    bridge.execute(SOURCE.read_text(encoding="utf-8"))
+    bridge.execute('events.SessionLoaded();entities[friend]=savedEntity;clock=clock+800;events.Tick()')
+    assert bridge.globals().noFollow == 0
+    assert bridge.globals().vars.OwnedFollowFlag is None
+
+
+def test_reassignment_preserves_cleanup_for_the_unavailable_old_actor(bridge):
+    combat(bridge)
+    bridge.execute('''
+      other="33333333-3333-3333-3333-333333333333"
+      entities[other]=entity(other,4)
+      Osi.DB_PartyMembers.Get=function() return {{host},{friend},{other}} end
+      savedEntity=entities[friend];entities[friend]=nil;control.companion=other
+      clock=clock+800;events.Tick()
+    ''')
+    g = bridge.globals()
+    assert g.statuses[g.other]
+    assert g.vars.OwnedCombat.actor == g.other
+    assert g.vars.OwnedCombat.releasing[g.friend]
+    bridge.execute('entities[friend]=savedEntity;clock=clock+800;events.Tick()')
+    assert not g.statuses[g.friend]
+    assert g.statuses[g.other]
+    assert g.vars.OwnedCombat.actor == g.other
+    assert not g.vars.OwnedCombat.releasing[g.friend]
+
+
+def test_unowned_combat_status_and_human_control_are_never_removed(bridge):
+    bridge.execute('''
+      statuses={[friend]=true,[host]=true};removed={};applied=0
+      Osi.IsInCombat=function() return 1 end
+      Osi.HasActiveStatus=function(actor) return statuses[actor] and 1 or 0 end
+      Osi.ApplyStatus=function() applied=applied+1 end
+      Osi.RemoveStatus=function(actor) removed[#removed+1]=actor;statuses[actor]=nil end
+      clock=clock+800;events.Tick()
+      control.enabled=false;clock=clock+800;events.Tick()
+      events.SessionLoaded();clock=clock+800;events.Tick()
+    ''')
+    g = bridge.globals()
+    assert g.statuses[g.friend] and g.statuses[g.host]
+    assert len(g.removed) == 0 and g.applied == 0
+    assert g.vars.OwnedCombat is None
 
 
 def test_automatic_combat_focus_cannot_change_human_identity(bridge):

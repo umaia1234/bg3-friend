@@ -11,6 +11,7 @@ from tkinter import font as tkfont
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from companion.game_window import GameWindow, enable_dpi_awareness
 from companion.protocol import read_json, write_json
+from companion.diagnostics import file_age
 
 BG, GOLD, MUTED, TEXT = '#191c1a', '#cfb47c', '#9eab9e', '#f0eadc'
 
@@ -311,15 +312,19 @@ class FriendWindow:
             self.choice = next(iter(self.members), None)
         self.sync_introductions(snapshot, control)
         active = self.is_enabled(control)
-        connected = time.time() - runner.get('updated', 0) < 8 and runner.get('runner') not in ('stopped', 'error')
+        connected = file_age(self.folder / 'runner.json') < 8 and runner.get('runner') != 'stopped'
         waiting = self.waiting_introduction(control) if not active else None
         self.heading.configure(text='파티  ·  ' + (waiting['name'] if waiting else self.members.get(self.choice, '동료')))
         self.dot.configure(fg='#96bb8a' if active and connected else MUTED)
         hint = ''
         if not connected:
             hint = '연결 끊김'
-        elif runner.get('error'):
-            hint = '응답 연결 확인'
+        elif runner.get('runner') == 'error':
+            hint = '설정 확인 필요'
+        elif runner.get('runner') == 'retrying':
+            hint = '연결 재시도 중'
+        elif runner.get('runner') == 'cancelling':
+            hint = '상황 확인 중'
         elif waiting:
             hint = '합류 기다리는 중'
         elif not active:
@@ -347,7 +352,7 @@ class FriendWindow:
         rect = (0, 0, 1440, 900) if self.preview else self.game.rect()
         show = rect and (self.preview or self.game.is_foreground())
         try:
-            show = show and (self.preview or time.time() - (self.folder / 'snapshot.json').stat().st_mtime < 4)
+            show = show and (self.preview or file_age(self.folder / 'snapshot.json') < 4)
         except OSError:
             show = False
         if show:

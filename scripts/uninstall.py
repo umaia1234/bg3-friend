@@ -1,52 +1,50 @@
-"""Remove this mod, preserving other mods, the shared extender, and saves."""
-from pathlib import Path
+"""Remove a managed installation transactionally, preserving saves and other mods."""
+from __future__ import annotations
+
 import argparse
 import json
-import os
-import shutil
-import subprocess
-import time
-import xml.etree.ElementTree as ET
+from pathlib import Path
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-UUID = "cfd9c54e-3884-47ed-9b40-82b8747194de"
+sys.path.insert(0, str(ROOT))
+from companion.installation import (InstallationError, PreflightError, STATE_FILE,
+                                    apply_plan, check_recovery, plan_uninstall)
+from scripts.install import default_state_root, error_output, process_check, require_stopped
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--profile", type=Path, required=True)
-    args = parser.parse_args()
-    ps = "powershell.exe" if os.name == "nt" else "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
-    result = subprocess.run([ps, "-NoProfile", "-NonInteractive", "-Command",
-                             "if(Get-Process bg3,bg3_dx11 -ErrorAction SilentlyContinue){exit 10}"], capture_output=True)
-    if result.returncode:
-        parser.error("Close BG3 before uninstalling")
-    settings = args.profile / "PlayerProfiles/Public/modsettings.lsx"
-    tree = ET.fromstring(settings.read_bytes())
-    for children in tree.findall(".//node[@id='Mods']/children") + tree.findall(".//node[@id='ModOrder']/children"):
-        for entry in list(children):
-            uid = entry.find("./attribute[@id='UUID']")
-            if uid is not None and uid.get("value") == UUID:
-                children.remove(entry)
-    backup = ROOT / ".runtime/backups" / (time.strftime("%Y%m%d-%H%M%S") + "-uninstall")
-    backup.mkdir(parents=True)
-    shutil.copy2(settings, backup / "modsettings.lsx")
-    pak = args.profile / "Mods/BG3Friend.pak"
-    if pak.exists():
-        shutil.copy2(pak, backup / pak.name)
-    ET.indent(tree)
-    temporary = settings.with_name(settings.name + ".bg3friend-uninstall.tmp")
-    temporary.write_bytes(ET.tostring(tree, encoding="utf-8", xml_declaration=True))
-    os.replace(temporary, settings)
-    pak.unlink(missing_ok=True)
-    control = args.profile / "Script Extender/BG3Friend/control.json"
-    if control.exists():
-        data = json.loads(control.read_text(encoding="utf-8-sig"))
-        data.update(enabled=False, revision=data.get("revision", 0) + 1)
-        control.write_text(json.dumps(data), encoding="utf-8")
-    print("BG3 Friend removed. Other mods, Script Extender, and saves retained.")
-    print("Backup:", backup)
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--state-root", type=Path)
+    parser.add_argument("--profile", type=Path, help="Optional legacy argument; must match the managed installation")
+    parser.add_argument("--dry-run", action="store_true", help="Read-only removal plan")
+    args = parser.parse_args(argv)
+    try:
+        state_root = (args.state_root or default_state_root()).absolute()
+        check_recovery(state_root)
+        manifest_path = state_root / STATE_FILE
+        if not manifest_path.is_file():
+            raise PreflightError("No managed installation was found. Pass the state directory used during installation with --state-root; legacy backup folders are not managed manifests")
+        try:
+            state = json.loads(manifest_path.read_text(encoding="utf-8"))
+            profile = Path(state["profile"])
+            if not profile.is_absolute():
+                raise ValueError("profile is not absolute")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PreflightError("The installation manifest is invalid; keep the original backups and inspect its profile path") from exc
+        if args.profile is not None and args.profile.absolute() != profile:
+            raise PreflightError("--profile does not match the installation recorded in --state-root")
+        check = process_check(profile)
+        require_stopped(check)
+        preview = plan_uninstall(state_root, game_running=check)
+        output = {"ok": True, "mode": "dry_run" if args.dry_run else "apply", "plan": preview.to_dict()}
+        if not args.dry_run:
+            output["result"] = apply_plan(preview, game_running=check).to_dict()
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+        return 0
+    except (InstallationError, OSError, ValueError, TypeError) as exc:
+        return error_output(exc)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

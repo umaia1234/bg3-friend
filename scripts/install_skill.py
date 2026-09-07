@@ -13,8 +13,12 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 NAME = "bg3-friend-start"
 FILES = ("SKILL.md", "agents/openai.yaml", "references/playbook.ko.md", "scripts/start.ps1")
-FIELDS = ("repository", "distro", "projectLinux", "projectWindows", "ioLinux",
-          "profileWindows", "windowsPython", "gameWindows", "steamExe", "steamAppId")
+BASE_FIELDS = ("repository", "steamAppId")
+SOURCE_FIELDS = ("distro", "projectLinux", "projectWindows", "ioLinux",
+                 "profileWindows", "gameWindows", "steamExe")
+WINDOWS_FIELDS = ("projectWindows", "profileWindows", "windowsPython", "gameWindows",
+                  "steamExe", "nativeExe", "nativeConfigRoot")
+FIELDS = BASE_FIELDS + SOURCE_FIELDS + ("windowsPython", "nativeExe", "nativeConfigRoot")
 
 
 def read_config(path: Path) -> dict:
@@ -25,22 +29,28 @@ def read_config(path: Path) -> dict:
 
 
 def validate_config(data: dict) -> None:
-    missing = [key for key in FIELDS if not isinstance(data.get(key), str) or not data[key].strip()]
+    required = BASE_FIELDS if data.get("nativeExe") else BASE_FIELDS + SOURCE_FIELDS
+    missing = [key for key in required if not isinstance(data.get(key), str) or not data[key].strip()]
     if missing:
         raise ValueError("Missing configuration: " + ", ".join(missing))
     if data["repository"] != "https://github.com/umaia1234/bg3-friend" or data["steamAppId"] != "1086940":
         raise ValueError("Configuration must identify BG3 Friend and Steam app 1086940")
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", data["distro"]):
-        raise ValueError("The bundled Windows launcher requires a simple WSL distribution name")
+    for key in FIELDS:
+        if key in data and not isinstance(data[key], str):
+            raise ValueError(key + " must be a string")
+    if data.get("distro") and not re.fullmatch(r"[A-Za-z0-9_.-]+", data["distro"]):
+        raise ValueError("Use a WSL distribution name containing letters, digits, dots, underscores or hyphens")
     for key in ("projectLinux", "ioLinux"):
-        if not PurePosixPath(data[key]).is_absolute():
+        if data.get(key) and not PurePosixPath(data[key]).is_absolute():
             raise ValueError(key + " must be an absolute WSL path")
-    for key in ("projectWindows", "profileWindows", "windowsPython", "gameWindows", "steamExe"):
-        if not PureWindowsPath(data[key]).is_absolute():
+    for key in WINDOWS_FIELDS:
+        if data.get(key) and not PureWindowsPath(data[key]).is_absolute():
             raise ValueError(key + " must be an absolute Windows path")
     for key in FIELDS:
-        if any(token in data[key] for token in ("YOUR_", "<", ">", "\n", "\r", '"')):
+        if any(token in data.get(key, "") for token in ("YOUR_", "<", ">", "\n", "\r", '"', "\x00")):
             raise ValueError(key + " contains an unresolved placeholder or invalid argument")
+    if data.get("nativeExe") and PureWindowsPath(data["nativeExe"]).suffix.lower() != ".exe":
+        raise ValueError("nativeExe must identify the Windows BG3 Friend .exe")
 
 
 def write_atomic(path: Path, content: bytes) -> None:

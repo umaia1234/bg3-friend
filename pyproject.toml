@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bg3-friend"
-version = "0.1.0"
-description = "Experimental BG3 companion co-player using Codex Astra"
+version = "0.2.0rc1"
+description = "BG3 companion co-player with a portable Windows setup app"
 requires-python = ">=3.11"
 dependencies = []
 
